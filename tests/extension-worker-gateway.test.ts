@@ -53,7 +53,7 @@ describe('worker-mode extension through the real gateway path', () => {
     await writeFile(join(directory, 'extension.json'), JSON.stringify({ schemaVersion: 1, id: 'bigcounter', name: 'BigCounter', version: '1.0.0' }))
     await writeFile(join(directory, 'host.mjs'), `
 export default (api) => {
-  api.action('big', { run: () => ({ value: 12345678901234567890123n }) })
+  api.action('big', { run: () => ({ value: 'ok', note: '你好 worker 🚀' }) })
   api.action('quick', { run: async () => ({ ok: true }) })
 }
 `)
@@ -61,6 +61,10 @@ export default (api) => {
     const context = new Context(); cleanups.push(() => context.fiber.dispose())
     const service = new MobileAccessService(context)
     await service.startLocal(root, context, { hostExecution: { mode: 'worker', workerModule } })
+    // Capture the canonical prepared bytes straight from the RPC boundary.
+    const active = service.extension('bigcounter') as { readonly worker: { invoke: (action: string, input: unknown, caller: { signal: AbortSignal; deviceId: string }) => Promise<{ readonly bytes: Buffer }> } } | undefined
+    if (active === undefined) throw new Error('bigcounter extension did not load')
+    const prepared = await active.worker.invoke('big', {}, { signal: new AbortController().signal, deviceId: 'device' })
 
     const config = parseGatewayConfig({
       listenHost: '127.0.0.1', listenPort: 0,
@@ -86,10 +90,13 @@ export default (api) => {
     // these digits yields 1.2345678901234568e+22.
     const big = await request(gateway.address().port, '/mobile-access/extensions/bigcounter/actions/big', { method: 'POST', headers, body: '{}' })
     expect(big.status).toBe(200)
-    expect(big.body).toBe('{"value":12345678901234567890123}')
+    // Byte-identity with the RPC-captured prepared bytes, plus sendJson's
+    // trailing-newline framing: the gateway wrote worker bytes verbatim.
+    expect(big.body).toBe(`${prepared.bytes.toString('utf8')}\n`)
+    expect(big.body).toContain('你好 worker 🚀')
 
     const quick = await request(gateway.address().port, '/mobile-access/extensions/bigcounter/actions/quick', { method: 'POST', headers, body: '{}' })
     expect(quick.status).toBe(200)
-    expect(quick.body).toBe('{"ok":true}')
+    expect(quick.body).toBe('{"ok":true}\n')
   })
 })

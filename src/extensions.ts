@@ -882,7 +882,14 @@ async function loadLocalExtension(directory: string, context: Context, known?: L
       : undefined
     let host: MobileExtensionDefinition
     if (worker !== undefined) {
-      await withActivationTimeout(worker.activate(), manifest.id, controller.signal)
+      try {
+        await withActivationTimeout(worker.activate(), manifest.id, controller.signal)
+      } catch (error) {
+        // A failed activation must not leak a live worker thread (the watcher
+        // retries every interval).
+        await worker.terminate('activation-failed')
+        throw error
+      }
       const proxyActions: Record<string, MobileHostAction> = {}
       for (const metadata of worker.actionMetadata()) {
         proxyActions[metadata.name] = {
@@ -897,8 +904,14 @@ async function loadLocalExtension(directory: string, context: Context, known?: L
         ...(metadata.timeoutMs === undefined ? {} : { timeoutMs: metadata.timeoutMs }),
         handle: request => worker.handleRoute(index, request),
       }))
-      host = validateDefinition({ ...manifest, ...(Object.keys(proxyActions).length === 0 ? {} : { actions: proxyActions }), ...(proxyRoutes.length === 0 ? {} : { routes: proxyRoutes }) })
-      cleanups.push(() => { void worker.dispose() })
+      try {
+        host = validateDefinition({ ...manifest, ...(Object.keys(proxyActions).length === 0 ? {} : { actions: proxyActions }), ...(proxyRoutes.length === 0 ? {} : { routes: proxyRoutes }) })
+      } catch (error) {
+        await worker.terminate('definition-invalid')
+        throw error
+      }
+      // Awaited: settleBounded in the teardown path can only bound awaited promises.
+      cleanups.push(() => worker.dispose())
     } else {
       const activate = async (): Promise<void> => {
         controller.signal.throwIfAborted()

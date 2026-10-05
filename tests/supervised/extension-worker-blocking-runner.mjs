@@ -109,13 +109,15 @@ export default (api) => {
     const closed = new Promise(resolve => { bridge.once('close', resolve) })
     bridge.destroy()
     await closed
-    // stream-cancel was posted; the blocked worker cannot end the stream, so
-    // the cancel grace must terminate the worker (bounded by the race below).
+    // The supervisor recorded a cancellation (it posted stream-cancel) …
+    const streamCancelled = host.streamStats().cancelledStreams >= 1
+    // … but the blocked worker cannot end the stream, so the cancel grace must
+    // terminate the worker (bounded by the race below).
     const terminated = await Promise.race([
       host.whenExited().then(() => true),
       new Promise(resolve => { setTimeout(() => resolve(false), 4_000) }),
     ])
-    return { streamCancelled: true, terminated }
+    return { streamCancelled, terminated }
   } finally {
     await rm(root, { recursive: true, force: true })
   }

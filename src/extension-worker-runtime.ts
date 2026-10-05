@@ -12,11 +12,15 @@ import { randomUUID } from 'node:crypto'
 import { pathToFileURL } from 'node:url'
 import z from '@deepseek-ai/schemastery'
 import {
+  businessErrorShape,
   normalizeWorkerRoutePath,
   serializeWorkerResult,
   validOperationTimeout,
+  WORKER_LOG_WINDOW_MS,
   WORKER_RESULT_MAX_BYTES,
+  WORKER_STREAM_AGGREGATE_BYTES,
   WORKER_STREAM_CREDIT_BYTES,
+  WORKER_STREAM_MAX_CHUNK_BYTES,
   type ParentMessage,
   type WorkerActionMetadata,
   type WorkerRouteMetadata,
@@ -64,7 +68,7 @@ const parentChannel = parentPort
 if (parentChannel === null) throw new Error('extension-worker-runtime must run inside a Worker')
 const port = parentChannel
 
-/** Bound on queued logger traffic so a chatty host cannot flood the channel. */
+/** Logger-adapter burst budget per time window; the budget resets each window. */
 const LOG_QUEUE_LIMIT = 64
 
 const runtimeId = randomUUID()
@@ -72,15 +76,21 @@ const generationController = new AbortController()
 const actions = new Map<string, RuntimeActionSpec>()
 const routes: RuntimeRouteSpec[] = []
 const cleanups: (() => void | Promise<void>)[] = []
-let logQueue = 0
+let logWindowCount = 0
+let logWindowStartedAt = Date.now()
 
 function send(message: unknown): void {
   port.postMessage(message)
 }
 
 function log(level: 'debug' | 'info' | 'warn' | 'error', args: readonly unknown[]): void {
-  if (logQueue >= LOG_QUEUE_LIMIT) return
-  logQueue += 1
+  const now = Date.now()
+  if (now - logWindowStartedAt >= WORKER_LOG_WINDOW_MS) {
+    logWindowStartedAt = now
+    logWindowCount = 0
+  }
+  if (logWindowCount >= LOG_QUEUE_LIMIT) return
+  logWindowCount += 1
   send({ kind: 'log', level, args })
 }
 
@@ -91,9 +101,12 @@ const loggerAdapter = {
   error: (...args: unknown[]) => { log('error', args) },
 }
 
+/** The lifecycle RPC id currently in flight, for outer-catch replies. */
+let lifecycleReplyId = 'lifecycle'
+
 port.on('message', (message: ParentMessage) => {
   void handleMessage(message).catch((error: unknown) => {
-    send({ kind: 'error', runtimeId, id: 'activate', code: 'extension_failed', message: error instanceof Error ? error.message : String(error), status: 500 })
+    send({ kind: 'error', runtimeId, id: lifecycleReplyId, code: 'extension_failed', message: error instanceof Error ? error.message : String(error), status: 500 })
   })
 })
 
@@ -110,33 +123,40 @@ const activeSources = new Map<string, import('node:stream').Readable>()
 /** Credit per stream id; the worker pauses a source when its window is exhausted. */
 const streamCredit = new Map<string, number>()
 
-/** Resolvers waiting for credit to become available, keyed by stream id. */
-const creditWaiters = new Map<string, (() => void)[]>()
+/** Sent and acknowledged bytes per stream; their difference is in-flight load. */
+const streamSent = new Map<string, number>()
+const streamAcked = new Map<string, number>()
 
-function grantCredit(id: string, bytes: number): void {
-  streamCredit.set(id, (streamCredit.get(id) ?? 0) + bytes)
-  wakeCreditWaiters(id)
+/** Resolvers waiting for send budget (window credit or aggregate headroom). */
+let sendBudgetWaiters: (() => void)[] = []
+
+/** Bytes sent but not yet acknowledged, across all live streams. */
+function inFlightTotal(): number {
+  let total = 0
+  for (const [id, sent] of streamSent) total += sent - (streamAcked.get(id) ?? 0)
+  return total
 }
 
-function wakeCreditWaiters(id: string): void {
-  for (const wake of creditWaiters.get(id) ?? []) wake()
-  creditWaiters.set(id, [])
+function wakeSendBudgetWaiters(): void {
+  for (const wake of sendBudgetWaiters) wake()
+  sendBudgetWaiters = []
 }
 
-async function waitForCredit(id: string, needed: number, bail: () => boolean): Promise<void> {
-  while ((streamCredit.get(id) ?? 0) < needed) {
+/**
+ * Wait until a piece may be sent: its per-stream window has credit AND the
+ * per-worker aggregate in-flight bound would not be exceeded.
+ */
+async function waitForSendBudget(id: string, length: number, bail: () => boolean): Promise<void> {
+  while ((streamCredit.get(id) ?? 0) < length || inFlightTotal() + length > WORKER_STREAM_AGGREGATE_BYTES) {
     if (bail()) return
-    await new Promise<void>(resolve => {
-      const waiters = creditWaiters.get(id) ?? []
-      waiters.push(resolve)
-      creditWaiters.set(id, waiters)
-    })
+    await new Promise<void>(resolve => { sendBudgetWaiters.push(resolve) })
   }
 }
 
 async function handleMessage(message: ParentMessage): Promise<void> {
   if (message.kind === 'activate') {
-    await activate(message.hostFile, message.generation)
+    lifecycleReplyId = message.id
+    await activate(message.id, message.hostFile, message.generation)
     return
   }
   if (message.kind === 'invoke') {
@@ -148,14 +168,16 @@ async function handleMessage(message: ParentMessage): Promise<void> {
     return
   }
   if (message.kind === 'stream-ack') {
-    grantCredit(message.id, message.bytes)
+    streamAcked.set(message.id, (streamAcked.get(message.id) ?? 0) + message.bytes)
+    streamCredit.set(message.id, (streamCredit.get(message.id) ?? 0) + message.bytes)
+    wakeSendBudgetWaiters()
     return
   }
   if (message.kind === 'stream-cancel') {
     const source = activeSources.get(message.id)
     source?.destroy()
-    // A pump parked on exhausted credit must wake up and observe the destroy.
-    wakeCreditWaiters(message.id)
+    // A pump parked on exhausted budget must wake up and observe the destroy.
+    wakeSendBudgetWaiters()
     return
   }
   if (message.kind === 'cancel') {
@@ -163,6 +185,7 @@ async function handleMessage(message: ParentMessage): Promise<void> {
     return
   }
   if (message.kind === 'dispose') {
+    lifecycleReplyId = message.id
     generationController.abort()
     for (const source of activeSources.values()) source.destroy()
     const pending: Promise<unknown>[] = []
@@ -170,7 +193,7 @@ async function handleMessage(message: ParentMessage): Promise<void> {
       try { pending.push(Promise.resolve(cleanup())) } catch { /* teardown cannot block the parent */ }
     }
     await Promise.race([Promise.allSettled(pending), new Promise(resolve => { setTimeout(resolve, 2_000).unref?.() })])
-    send({ kind: 'result', runtimeId, id: 'dispose', bytes: new Uint8Array() })
+    send({ kind: 'result', runtimeId, id: message.id, bytes: new Uint8Array() })
     return
   }
 }
@@ -227,6 +250,11 @@ async function runRoute(message: {
       bytes,
     })
   } catch (error) {
+    const business = businessErrorShape(error)
+    if (business !== undefined) {
+      send({ kind: 'error', runtimeId, id: message.id, code: business.code, message: business.message, status: business.status })
+      return
+    }
     send({ kind: 'error', runtimeId, id: message.id, code: 'extension_failed', message: error instanceof Error ? error.message : String(error), status: 500 })
   } finally {
     requestControllers.delete(message.id)
@@ -240,7 +268,9 @@ function isStream(value: unknown): value is import('node:stream').Readable {
 
 async function pumpStream(id: string, source: import('node:stream').Readable, meta: { status?: number; contentType?: string; headers?: Record<string, string> }): Promise<void> {
   activeSources.set(id, source)
-  streamCredit.set(id, WORKER_STREAM_CREDIT_BYTES)
+  streamCredit.set(id, Math.max(0, Math.min(WORKER_STREAM_CREDIT_BYTES, WORKER_STREAM_AGGREGATE_BYTES - inFlightTotal())))
+  streamSent.set(id, 0)
+  streamAcked.set(id, 0)
   send({
     kind: 'stream-start', runtimeId, id,
     ...(meta.status === undefined ? {} : { status: meta.status }),
@@ -253,7 +283,10 @@ async function pumpStream(id: string, source: import('node:stream').Readable, me
     ended = true
     activeSources.delete(id)
     streamCredit.delete(id)
-    creditWaiters.delete(id)
+    streamSent.delete(id)
+    streamAcked.delete(id)
+    // Freed aggregate budget may unblock other streams.
+    wakeSendBudgetWaiters()
   }
   source.once('error', error => {
     if (ended) return
@@ -264,17 +297,22 @@ async function pumpStream(id: string, source: import('node:stream').Readable, me
     for await (const chunk of source) {
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array)
       if (ended) return
-      // Explicit pull/credit flow control: never send beyond the window.
-      await waitForCredit(id, bytes.byteLength, () => source.destroyed || ended)
-      if (ended || source.destroyed || generationController.signal.aborted) {
-        finish()
-        send({ kind: 'stream-end', runtimeId, id })
-        source.destroy()
-        return
+      // A chunk larger than the whole window can never be granted: split it.
+      for (let offset = 0; offset < bytes.byteLength;) {
+        const piece = bytes.subarray(offset, Math.min(offset + WORKER_STREAM_MAX_CHUNK_BYTES, bytes.byteLength))
+        // Explicit pull/credit flow control plus the per-worker aggregate bound.
+        await waitForSendBudget(id, piece.byteLength, () => source.destroyed || ended)
+        if (ended || source.destroyed || generationController.signal.aborted) {
+          finish()
+          send({ kind: 'stream-end', runtimeId, id })
+          source.destroy()
+          return
+        }
+        streamCredit.set(id, (streamCredit.get(id) ?? 0) - piece.byteLength)
+        streamSent.set(id, (streamSent.get(id) ?? 0) + piece.byteLength)
+        send({ kind: 'stream-chunk', runtimeId, id, bytes: new Uint8Array(piece) })
+        offset += piece.byteLength
       }
-      const credit = (streamCredit.get(id) ?? 0) - bytes.byteLength
-      streamCredit.set(id, credit)
-      send({ kind: 'stream-chunk', runtimeId, id, bytes: new Uint8Array(bytes) })
     }
     finish()
     send({ kind: 'stream-end', runtimeId, id })
@@ -285,7 +323,7 @@ async function pumpStream(id: string, source: import('node:stream').Readable, me
   }
 }
 
-async function activate(hostFile: string, generation: string): Promise<void> {
+async function activate(replyId: string, hostFile: string, generation: string): Promise<void> {
   const api: RuntimeHostApi = {
     manifest: { id: hostFile },
     context: { logger: loggerAdapter },
@@ -313,14 +351,14 @@ async function activate(hostFile: string, generation: string): Promise<void> {
   try {
     imported = await import(`${pathToFileURL(hostFile).href}?dsh_generation=${generation}`) as HostModule
   } catch {
-    send({ kind: 'error', runtimeId, id: 'activate', code: 'host_load_failed', message: 'could not load host.mjs', status: 500 })
+    send({ kind: 'error', runtimeId, id: replyId, code: 'host_load_failed', message: 'could not load host.mjs', status: 500 })
     return
   }
   if (generationController.signal.aborted) return
   try {
     if (imported.default !== undefined) await imported.default(api)
   } catch (error) {
-    send({ kind: 'error', runtimeId, id: 'activate', code: 'host_activation_failed', message: error instanceof Error ? error.message : String(error), status: 500 })
+    send({ kind: 'error', runtimeId, id: replyId, code: 'host_activation_failed', message: error instanceof Error ? error.message : String(error), status: 500 })
     return
   }
   const actionMetadata: WorkerActionMetadata[] = [...actions.entries()].map(([name, spec]) => {
@@ -350,11 +388,25 @@ async function runAction(id: string, name: string, deviceId: string, input: unkn
   const onGenerationAbort = (): void => { controller.abort(generationController.signal.reason) }
   if (generationController.signal.aborted) controller.abort()
   else generationController.signal.addEventListener('abort', onGenerationAbort, { once: true })
+  const errorReply = (error: unknown): void => {
+    const business = businessErrorShape(error)
+    if (business !== undefined) {
+      send({ kind: 'error', runtimeId, id, code: business.code, message: business.message, status: business.status })
+      return
+    }
+    send({ kind: 'error', runtimeId, id, code: 'extension_failed', message: error instanceof Error ? error.message : String(error), status: 500 })
+  }
   try {
     let parsed = input
     if (spec.input !== undefined) {
-      parsed = typeof spec.input === 'function' ? spec.input(input) : spec.input.parse(input)
-      parsed = await parsed
+      try {
+        parsed = typeof spec.input === 'function' ? spec.input(input) : spec.input.parse(input)
+        parsed = await parsed
+      } catch {
+        // Input validation failures keep the in-process contract: 400.
+        send({ kind: 'error', runtimeId, id, code: 'invalid_action_input', message: 'action input is invalid', status: 400 })
+        return
+      }
     }
     controller.signal.throwIfAborted()
     const value = await spec.run({ signal: controller.signal, deviceId }, parsed)
@@ -365,7 +417,7 @@ async function runAction(id: string, name: string, deviceId: string, input: unkn
     }
     send({ kind: 'result', runtimeId, id, bytes })
   } catch (error) {
-    send({ kind: 'error', runtimeId, id, code: 'extension_failed', message: error instanceof Error ? error.message : String(error), status: 500 })
+    errorReply(error)
   } finally {
     requestControllers.delete(id)
     generationController.signal.removeEventListener('abort', onGenerationAbort)

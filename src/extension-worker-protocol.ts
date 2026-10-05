@@ -14,6 +14,15 @@ export const WORKER_RESULT_MAX_BYTES = 4 * 1024 * 1024
 /** Per-stream credit window: the worker may send at most this many unacknowledged bytes. */
 export const WORKER_STREAM_CREDIT_BYTES = 256 * 1024
 
+/** The worker splits source chunks larger than this before credit control. */
+export const WORKER_STREAM_MAX_CHUNK_BYTES = 64 * 1024
+
+/** Per-worker aggregate bound: total unacknowledged bytes across ALL streams. */
+export const WORKER_STREAM_AGGREGATE_BYTES = 1024 * 1024
+
+/** Logger-adapter budget per time window: bursts are allowed, silence is not permanent. */
+export const WORKER_LOG_WINDOW_MS = 1_000
+
 /** If a cancelled stream is not ended by the worker within this grace, the supervisor terminates it. */
 export const WORKER_STREAM_CANCEL_GRACE_MS = 1_000
 
@@ -23,15 +32,10 @@ export const WORKER_OPERATION_TIMEOUT_MS = 30_000
 /** After a deadline-detached action fails to settle within this grace, the worker is terminated. */
 export const WORKER_DEADLINE_GRACE_MS = 250
 
-/** JSON.stringify escapes NUL inside strings, so a raw NUL only comes from this placeholder. */
-const NUL = String.fromCharCode(0)
-const BIGINT_PLACEHOLDER = `${NUL}__bigint__:`
-/** stringify renders the placeholder's NUL as the literal text backslash-u0000; match that. */
-const BIGINT_PATTERN = new RegExp(`"\\\\u0000__bigint__:(-?\\d+)"`, 'gu')
-
 /** Parent → worker: activate one extension generation inside this runtime. */
 export interface WorkerActivateMessage {
   readonly kind: 'activate'
+  readonly id: string
   readonly hostFile: string
   readonly generation: string
 }
@@ -54,6 +58,7 @@ export interface WorkerCancelMessage {
 /** Parent → worker: run generation teardown inside the runtime. */
 export interface WorkerDisposeMessage {
   readonly kind: 'dispose'
+  readonly id: string
 }
 
 /** Parent → worker: run one route handler; the body crosses as bytes. */
@@ -193,16 +198,26 @@ export function normalizeWorkerRoutePath(value: string): string {
 }
 
 /**
+ * Recognize a controlled business error (MobileExtensionError shape) thrown by
+ * host code so its code/status survive the boundary instead of collapsing to
+ * a generic 500. Pure duck-typing keeps the runtime Cordis-free.
+ */
+export function businessErrorShape(error: unknown): { readonly code: string; readonly message: string; readonly status: number } | undefined {
+  if (error === null || typeof error !== 'object') return undefined
+  const candidate = error as { readonly code?: unknown; readonly message?: unknown; readonly status?: unknown }
+  if (typeof candidate.code !== 'string' || candidate.code.length === 0 || candidate.code.length > 64) return undefined
+  if (typeof candidate.message !== 'string' || candidate.message.length > 500) return undefined
+  if (typeof candidate.status !== 'number' || !Number.isInteger(candidate.status) || candidate.status < 400 || candidate.status > 599) return undefined
+  return { code: candidate.code, message: candidate.message, status: candidate.status }
+}
+
+/**
  * Serialize an action result to JSON bytes worker-side.
  *
- * Unlike JSON.stringify, large integers keep their exact digits when the value
- * is a BigInt — proof that the bytes were produced by the worker: the gateway
- * could not reconstruct them from a JavaScript number.
+ * Plain JSON.stringify, matching the in-process gateway contract exactly:
+ * non-JSON-serializable values (e.g. BigInt) throw and surface as
+ * `extension_failed`, same as in-process mode today.
  */
 export function serializeWorkerResult(value: unknown): Uint8Array {
-  const serialized = JSON.stringify(value, (_key, item: unknown) => {
-    if (typeof item === 'bigint') return `${BIGINT_PLACEHOLDER}${item.toString()}`
-    return item
-  }) ?? 'null'
-  return new TextEncoder().encode(serialized.replace(BIGINT_PATTERN, '$1'))
+  return new TextEncoder().encode(JSON.stringify(value) ?? 'null')
 }
