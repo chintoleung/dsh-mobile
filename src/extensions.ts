@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url'
 import { Service, type Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { finished, type Readable } from 'node:stream'
+import { defaultExtensionWorkerModule, ExtensionWorkerHost, type WorkerParentLogger } from './extension-worker.js'
 
 /** Maximum sizes enforced at the local-extension filesystem boundary. */
 export const EXTENSION_LIMITS = Object.freeze({
@@ -152,6 +153,7 @@ interface ActiveLocalExtension {
   readonly controller: AbortController
   readonly cleanups: readonly (() => void | Promise<void>)[]
   readonly digest: string
+  readonly worker?: ExtensionWorkerHost
 }
 
 interface RegisteredExtension {
@@ -162,6 +164,11 @@ interface RegisteredExtension {
 interface RetiredLocalExtension {
   readonly active: ActiveLocalExtension
   readonly timer: NodeJS.Timeout
+}
+
+/** Spike: how local extension hosts execute. Default is today's in-process mode. */
+export interface LocalExecutionOptions {
+  readonly hostExecution?: { readonly mode: 'in-process' | 'worker'; readonly workerModule?: string }
 }
 
 type HostApi = {
@@ -453,6 +460,7 @@ export class MobileAccessService extends Service {
   private localRefreshAbort: AbortController | undefined
   private localLifecycle = 0
   private localClosed = true
+  private localExecution: LocalExecutionOptions | undefined
 
   constructor(ctx: Context) { super(ctx, 'mobileAccess') }
 
@@ -608,12 +616,12 @@ export class MobileAccessService extends Service {
   }
 
   /** Start the local directory watcher; an absent directory is intentionally inert. */
-  async startLocal(root: string, context: Context): Promise<void> {
+  async startLocal(root: string, context: Context, options?: LocalExecutionOptions): Promise<void> {
     const targetRoot = resolve(root)
     if (this.localRoot !== undefined && resolve(this.localRoot) !== targetRoot) await this.stopLocal()
     if (this.localTimer !== undefined) clearInterval(this.localTimer)
     const lifecycle = ++this.localLifecycle
-    this.localRoot = targetRoot; this.localContext = context; this.localClosed = false
+    this.localRoot = targetRoot; this.localContext = context; this.localExecution = options; this.localClosed = false
     await mkdir(this.localRoot, { recursive: true })
     if (this.localClosed || this.localLifecycle !== lifecycle || this.localRoot !== targetRoot || this.localContext !== context) return
     await this.refreshLocal()
@@ -688,7 +696,7 @@ export class MobileAccessService extends Service {
         const previous = current?.digest === fingerprint.digest ? current : retired?.digest === fingerprint.digest ? retired : undefined
         if (previous?.digest === fingerprint.digest) staged.push(previous)
         else {
-          const fresh = await loadLocalExtension(directory, this.localContext, fingerprint, signal)
+          const fresh = await loadLocalExtension(directory, this.localContext, fingerprint, signal, this.localExecution)
           try {
             signal.throwIfAborted()
             const confirmed = await extensionFingerprint(directory)
@@ -812,7 +820,7 @@ async function abortAndDisposeLocal(entries: readonly ActiveLocalExtension[]): P
   await settleBounded(pending, HOST_TEARDOWN_TIMEOUT_MS)
 }
 
-async function loadLocalExtension(directory: string, context: Context, known?: LocalExtensionFingerprint, parentSignal?: AbortSignal): Promise<ActiveLocalExtension> {
+async function loadLocalExtension(directory: string, context: Context, known?: LocalExtensionFingerprint, parentSignal?: AbortSignal, execution?: LocalExecutionOptions): Promise<ActiveLocalExtension> {
   const root = await realExtensionRoot(directory)
   const manifestFile = await regularFile(join(root, 'extension.json'), EXTENSION_LIMITS.manifest, 'extension.json')
   const manifest = known?.manifest ?? parseExtensionManifest(JSON.parse(await readFile(manifestFile.path, 'utf8')) as unknown)
@@ -860,24 +868,57 @@ async function loadLocalExtension(directory: string, context: Context, known?: L
     },
   }
   try {
-    const activate = async (): Promise<void> => {
-      controller.signal.throwIfAborted()
-      if (hostFile !== undefined) {
-        const digest = createHash('sha256').update(await readFile(hostFile)).digest('hex')
-        controller.signal.throwIfAborted()
-        let imported: LocalHostModule
-        try { imported = await import(`${pathToFileURL(hostFile).href}?dsh_generation=${digest}`) as LocalHostModule }
-        catch { throw new MobileExtensionError('host_load_failed', `could not load ${manifest.id}/host.mjs`, 500) }
-        controller.signal.throwIfAborted()
-        if (imported.default !== undefined) await imported.default(api)
+    // Spike worker mode: all executable host behavior runs inside one worker
+    // per generation; registration crosses as metadata only and action results
+    // cross as worker-serialized bytes.
+    const worker = execution?.hostExecution?.mode === 'worker' && hostFile !== undefined
+      ? new ExtensionWorkerHost({
+        workerModule: execution.hostExecution.workerModule ?? defaultExtensionWorkerModule(),
+        hostFile,
+        manifest,
+        generation: known?.digest ?? createHash('sha256').update(manifest.id).digest('hex'),
+        logger: workerLoggerAdapter(context),
+      })
+      : undefined
+    let host: MobileExtensionDefinition
+    if (worker !== undefined) {
+      await withActivationTimeout(worker.activate(), manifest.id, controller.signal)
+      const proxyActions: Record<string, MobileHostAction> = {}
+      for (const metadata of worker.actionMetadata()) {
+        proxyActions[metadata.name] = {
+          ...(metadata.timeoutMs === undefined ? {} : { timeoutMs: metadata.timeoutMs }),
+          run: (actionContext, input) => worker.invoke(metadata.name, input, actionContext),
+        }
       }
-      await Promise.all(pendingEffects)
+      const proxyRoutes: MobileHostRoute[] = worker.routeMetadata().map((metadata, index) => ({
+        method: metadata.method,
+        path: metadata.path,
+        ...(metadata.kind === undefined ? {} : { kind: metadata.kind }),
+        ...(metadata.timeoutMs === undefined ? {} : { timeoutMs: metadata.timeoutMs }),
+        handle: request => worker.handleRoute(index, request),
+      }))
+      host = validateDefinition({ ...manifest, ...(Object.keys(proxyActions).length === 0 ? {} : { actions: proxyActions }), ...(proxyRoutes.length === 0 ? {} : { routes: proxyRoutes }) })
+      cleanups.push(() => { void worker.dispose() })
+    } else {
+      const activate = async (): Promise<void> => {
+        controller.signal.throwIfAborted()
+        if (hostFile !== undefined) {
+          const digest = createHash('sha256').update(await readFile(hostFile)).digest('hex')
+          controller.signal.throwIfAborted()
+          let imported: LocalHostModule
+          try { imported = await import(`${pathToFileURL(hostFile).href}?dsh_generation=${digest}`) as LocalHostModule }
+          catch { throw new MobileExtensionError('host_load_failed', `could not load ${manifest.id}/host.mjs`, 500) }
+          controller.signal.throwIfAborted()
+          if (imported.default !== undefined) await imported.default(api)
+        }
+        await Promise.all(pendingEffects)
+      }
+      await withActivationTimeout(activate(), manifest.id, controller.signal)
+      host = validateDefinition({ ...manifest, actions, routes })
     }
-    await withActivationTimeout(activate(), manifest.id, controller.signal)
-    const host = validateDefinition({ ...manifest, actions, routes })
     activationOpen = false
     const digest = known?.digest ?? createHash('sha256').update(manifest.id).digest('hex')
-    return Object.freeze({ manifest, directory: root, ...(scriptBody === undefined ? {} : { scriptBody }), ...(styleBody === undefined ? {} : { styleBody }), assets, host, controller, cleanups: Object.freeze(cleanups), digest })
+    return Object.freeze({ manifest, directory: root, ...(scriptBody === undefined ? {} : { scriptBody }), ...(styleBody === undefined ? {} : { styleBody }), assets, host, controller, cleanups: Object.freeze(cleanups), digest, ...(worker === undefined ? {} : { worker }) })
   } catch (error) {
     activationOpen = false
     controller.abort()
@@ -886,6 +927,16 @@ async function loadLocalExtension(directory: string, context: Context, known?: L
     throw error
   } finally {
     parentSignal?.removeEventListener('abort', onParentAbort)
+  }
+}
+
+/** Forward the worker's logger-only context adapter into the plugin logger. */
+function workerLoggerAdapter(context: Context): WorkerParentLogger {
+  return {
+    debug: (...args: unknown[]) => { context.logger.debug(...args as Parameters<typeof context.logger.debug>) },
+    info: (...args: unknown[]) => { context.logger.info(...args as Parameters<typeof context.logger.info>) },
+    warn: (...args: unknown[]) => { context.logger.warn(...args as Parameters<typeof context.logger.warn>) },
+    error: (...args: unknown[]) => { context.logger.error(...args as Parameters<typeof context.logger.error>) },
   }
 }
 
