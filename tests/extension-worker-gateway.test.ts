@@ -85,9 +85,12 @@ export default (api) => {
     const session = cookie(paired.headers, SESSION_COOKIE); const csrf = JSON.parse(paired.body) as { csrfToken: string }
     const headers = { host: new URL(origin).host, origin, 'sec-fetch-site': 'same-origin', cookie: session, [CSRF_HEADER]: csrf.csrfToken, 'content-type': 'application/json' }
 
-    // BigInt survives with exact digits — bytes the gateway could not produce:
-    // JSON.stringify throws on BigInt, and a parse+restringify round trip of
-    // these digits yields 1.2345678901234568e+22.
+    // Pass-through plumbing proof: the response is byte-identical to the
+    // bytes captured at the RPC boundary (plus sendJson's trailing newline).
+    // Note: this cannot distinguish reserialization by bytes alone — the
+    // worker's serializer is JSON.stringify, whose output is round-trip
+    // stable by construction; the architectural guarantee (the value never
+    // crosses the boundary) is enforced by the PreparedJsonResult type.
     const big = await request(gateway.address().port, '/mobile-access/extensions/bigcounter/actions/big', { method: 'POST', headers, body: '{}' })
     expect(big.status).toBe(200)
     // Byte-identity with the RPC-captured prepared bytes, plus sendJson's

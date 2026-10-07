@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Readable } from 'node:stream'
 import { afterEach, describe, expect, it } from 'vitest'
-import { buildExtensionWorkerEntry } from './helpers/extension-worker-build.js'
+import { buildExtensionWorkerArtifacts, buildExtensionWorkerEntry } from './helpers/extension-worker-build.js'
 import { WORKER_STREAM_AGGREGATE_BYTES, WORKER_STREAM_CREDIT_BYTES } from '../src/extension-worker-protocol.js'
 import { activeWorkerCount, ExtensionWorkerHost, PreparedJsonResult } from '../src/extension-worker.js'
 import { MobileAccessService } from '../src/extensions.js'
@@ -214,6 +214,61 @@ export default (api) => {
     expect(total).toBeGreaterThanOrEqual(300 * 1024)
     fat.destroy()
   })
+
+  it('delivers a complete finite stream to a delayed consumer', async () => {
+    const workerModule = await buildExtensionWorkerEntry()
+    const root = await mkdtemp(join(tmpdir(), 'dsh-mobile-worker-eof-'))
+    directories.push(root)
+    await createExtensionDirectory(root, 'finstream', `
+import { Readable } from 'node:stream'
+export default (api) => {
+  const build = (size, filler) => Readable.from([Buffer.alloc(size, filler)])
+  api.route({ method: 'GET', path: 'small', handle: () => ({ contentType: 'application/octet-stream', body: build(192 * 1024, 7) }) })
+  api.route({ method: 'GET', path: 'large', handle: () => ({ contentType: 'application/octet-stream', body: build(700 * 1024, 8) }) })
+}
+`)
+    const context = new Context(); contexts.push(context)
+    const service = new MobileAccessService(context)
+    services.push(service)
+    await service.startLocal(root, context, { hostExecution: { mode: 'worker', workerModule } })
+
+    const openRoute = async (path: string): Promise<Readable> => {
+      const result = await service.route('finstream', 'GET', path, {
+        method: 'GET', pathname: path, query: new URLSearchParams(), headers: {},
+        body: Buffer.alloc(0), signal: new AbortController().signal, deviceId: 'device',
+      })
+      return result.body as Readable
+    }
+
+    for (const [path, filler, expectedBytes] of [['/small', 7, 192 * 1024], ['/large', 8, 700 * 1024]] as const) {
+      const stream = await openRoute(path)
+      // Delay reading until the worker has fully finished and sent stream-end.
+      await new Promise(resolve => { setTimeout(resolve, 400) })
+      const received = await new Promise<{ bytes: number; ended: boolean }>((resolveDone, rejectDone) => {
+        let sum = 0
+        const watchdog = setTimeout(() => rejectDone(new Error(`${path} stalled at ${String(sum)} of ${String(expectedBytes)} bytes`)), 8_000)
+        const readOne = (): void => {
+          const chunk = stream.read() as Buffer | null
+          if (chunk === null) {
+            stream.once('readable', () => { stream.removeListener('end', onEnd); readOne() })
+            stream.once('end', onEnd)
+            return
+          }
+          expect([...chunk].every(byte => byte === filler)).toBe(true)
+          sum += chunk.byteLength
+          setTimeout(readOne, 5)
+        }
+        const onEnd = (): void => { clearTimeout(watchdog); resolveDone({ bytes: sum, ended: true }) }
+        stream.on('end', onEnd)
+        stream.on('error', rejectDone)
+        readOne()
+      })
+      // The entire payload must survive EOF, including bytes still queued in
+      // the bridge when the worker finished.
+      expect(received.bytes).toBe(expectedBytes)
+      expect(received.ended).toBe(true)
+    }
+  })
 })
 
 describe('extension worker termination contract', () => {
@@ -298,6 +353,75 @@ export default (api) => {
     expect(active.worker.streamStats().maxBufferedBytes).toBeGreaterThan(WORKER_STREAM_CREDIT_BYTES)
     for (const bridge of bridges) bridge.destroy()
     await new Promise(resolve => { setTimeout(resolve, 100) })
+  })
+
+  it('recovers from aggregate saturation: a starved stream progresses once budget frees', async () => {
+    const workerModule = await buildExtensionWorkerEntry()
+    const root = await mkdtemp(join(tmpdir(), 'dsh-mobile-worker-starve-'))
+    directories.push(root)
+    await createExtensionDirectory(root, 'fanout2', `
+import { Readable } from 'node:stream'
+export default (api) => {
+  api.route({
+    method: 'GET',
+    path: 'firehose',
+    handle: () => {
+      function* chunks() { while (true) yield Buffer.alloc(64 * 1024, 5) }
+      return { contentType: 'application/octet-stream', body: Readable.from(chunks()) }
+    },
+  })
+}
+`)
+    const context = new Context(); contexts.push(context)
+    const service = new MobileAccessService(context)
+    services.push(service)
+    await service.startLocal(root, context, { hostExecution: { mode: 'worker', workerModule } })
+    const active = service.extension('fanout2') as { readonly worker: ExtensionWorkerHost } | undefined
+    if (active === undefined) throw new Error('fanout2 extension did not load')
+
+    // Saturate the aggregate with four unconsumed streams, then open a fifth.
+    const saturated: Readable[] = []
+    for (let index = 0; index < 4; index += 1) {
+      const result = await service.route('fanout2', 'GET', '/firehose', {
+        method: 'GET', pathname: '/firehose', query: new URLSearchParams(), headers: {},
+        body: Buffer.alloc(0), signal: new AbortController().signal, deviceId: 'device',
+      })
+      saturated.push(result.body as Readable)
+    }
+    await new Promise(resolve => { setTimeout(resolve, 250) })
+    const fifth = (await service.route('fanout2', 'GET', '/firehose', {
+      method: 'GET', pathname: '/firehose', query: new URLSearchParams(), headers: {},
+      body: Buffer.alloc(0), signal: new AbortController().signal, deviceId: 'device',
+    })).body as Readable
+
+    // Now drain the four saturating streams: the fifth must eventually send
+    // (a zero-initial-credit stream may not starve forever), and the
+    // aggregate bound must hold throughout recovery.
+    for (const stream of saturated) {
+      const read = stream.read()
+      void read
+    }
+    const progress = await new Promise<number>((resolveDone, rejectDone) => {
+      let sum = 0
+      const watchdog = setTimeout(() => rejectDone(new Error(`fifth stream starved at ${String(sum)} bytes`)), 6_000)
+      const readOne = (): void => {
+        const chunk = fifth.read() as Buffer | null
+        if (chunk === null) {
+          const onReadable = (): void => { fifth.removeListener('readable', onReadable); readOne() }
+          fifth.once('readable', onReadable)
+          return
+        }
+        sum += chunk.byteLength
+        if (sum >= 64 * 1024) { clearTimeout(watchdog); resolveDone(sum); return }
+        setTimeout(readOne, 10)
+      }
+      fifth.on('error', rejectDone)
+      setTimeout(readOne, 25)
+    })
+    expect(progress).toBeGreaterThanOrEqual(64 * 1024)
+    expect(active.worker.streamStats().maxBufferedBytes).toBeLessThanOrEqual(WORKER_STREAM_AGGREGATE_BYTES)
+    fifth.destroy()
+    for (const stream of saturated) stream.destroy()
   })
 
   it('enforces a parent-owned deadline for buffered route responses', async () => {
@@ -436,5 +560,173 @@ setInterval(() => {}, 60_000)
     // The fake worker never activates: expect the bounded timeout, not a crash.
     await expect(host.activate()).rejects.toMatchObject({ code: 'host_load_timeout' })
     expect(lines.some(args => args[0] === 'survived')).toBe(true)
+  })
+
+  it('boots a worker through the default resolver without an explicit module path', async () => {
+    // The packaged path resolves the runtime entry next to the supervisor
+    // bundle; the helper builds both into one directory, so the bundled
+    // supervisor's own default resolver is exercised exactly as shipped.
+    const artifacts = await buildExtensionWorkerArtifacts()
+    const bundle = await import(artifacts.supervisorBundle) as typeof import('../src/extension-worker.js')
+    const resolved = bundle.defaultExtensionWorkerModule()
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-mobile-worker-default-'))
+    directories.push(directory)
+    const extensionDir = join(directory, 'defres')
+    await mkdir(extensionDir, { recursive: true })
+    await writeFile(join(extensionDir, 'extension.json'), JSON.stringify({ schemaVersion: 1, id: 'defres', name: 'defres', version: '1.0.0' }))
+    await writeFile(join(extensionDir, 'host.mjs'), 'export default (api) => { api.action("ping", { run: async () => ({ via: "default" }) }) }')
+    const host = new bundle.ExtensionWorkerHost({
+      workerModule: resolved,
+      hostFile: join(extensionDir, 'host.mjs'),
+      manifest: { schemaVersion: 1, id: 'defres', name: 'defres', version: '1.0.0' },
+      generation: 'default-resolver',
+      logger: { debug() {}, info() {}, warn() {}, error() {} },
+    })
+    hosts.push(host)
+    const activated = await host.activate()
+    expect(activated.actions.map(action => action.name)).toEqual(['ping'])
+    const reply = await host.invoke('ping', {}, caller())
+    expect(reply.bytes.toString('utf8')).toBe('{"via":"default"}')
+  })
+
+  it('cancels a late stream response whose caller already timed out', async () => {
+    const workerModule = await buildExtensionWorkerEntry()
+    const root = await mkdtemp(join(tmpdir(), 'dsh-mobile-worker-late-'))
+    directories.push(root)
+    await createExtensionDirectory(root, 'latestream', `
+import { Readable } from 'node:stream'
+export default (api) => {
+  api.action('ping', { run: async () => ({ ok: true }) })
+  api.route({
+    method: 'GET',
+    path: 'delayed-stream',
+    timeoutMs: 150,
+    handle: async () => {
+      await new Promise(resolve => { setTimeout(resolve, 350) })
+      return { contentType: 'application/octet-stream', body: Readable.from([Buffer.alloc(64 * 1024, 3)]) }
+    },
+  })
+}
+`)
+    const context = new Context(); contexts.push(context)
+    const service = new MobileAccessService(context)
+    services.push(service)
+    await service.startLocal(root, context, { hostExecution: { mode: 'worker', workerModule } })
+    const active = service.extension('latestream') as { readonly worker: ExtensionWorkerHost } | undefined
+    if (active === undefined) throw new Error('latestream extension did not load')
+
+    const hung = service.route('latestream', 'GET', '/delayed-stream', {
+      method: 'GET', pathname: '/delayed-stream', query: new URLSearchParams(), headers: {},
+      body: Buffer.alloc(0), signal: new AbortController().signal, deviceId: 'device',
+    })
+    // The caller settles at its deadline; the handler returns a stream later.
+    await expect(hung).rejects.toMatchObject({ code: 'extension_route_timeout', status: 500 })
+    await new Promise(resolve => { setTimeout(resolve, 600) })
+
+    // The late stream must be cancelled and supervised to an end — not left
+    // as an orphaned bridge nobody consumes.
+    expect(active.worker.streamStats().activeStreams).toBe(0)
+    expect(active.worker.streamStats().cancelledStreams).toBeGreaterThanOrEqual(1)
+    // Cleanup supervision disarms only on confirmed end, so the worker
+    // (which cooperated) survives and still serves.
+    await expect(service.invoke('latestream', 'ping', {}, caller())).resolves.toBeInstanceOf(PreparedJsonResult)
+  })
+
+  it('rejects a malformed route reply instead of orphaning the RPC', async () => {
+    const workerModule = await buildExtensionWorkerEntry()
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-mobile-worker-badreply-'))
+    directories.push(directory)
+    const fakeModule = join(directory, 'bad-reply-worker.mjs')
+    await writeFile(fakeModule, `
+import { parentPort } from 'node:worker_threads'
+parentPort.on('message', (message) => {
+  if (message.kind === 'activate') {
+    parentPort.postMessage({ kind: 'activated', runtimeId: 'bad-reply', actions: [], routes: [{ method: 'GET', path: '/x', kind: 'exact' }] })
+    return
+  }
+  if (message.kind === 'route') {
+    // Malformed payload: bytes is not a Uint8Array.
+    parentPort.postMessage({ kind: 'route-response', runtimeId: 'bad-reply', id: message.id, bytes: { bad: true } })
+  }
+})
+setInterval(() => {}, 60_000)
+`)
+    const host = new ExtensionWorkerHost({
+      workerModule: fakeModule,
+      hostFile: join(directory, 'host.mjs'),
+      manifest: { schemaVersion: 1, id: 'badreply', name: 'badreply', version: '1.0.0' },
+      generation: 'bad-reply',
+      logger: { debug() {}, info() {}, warn() {}, error() {} },
+    })
+    hosts.push(host)
+    await host.activate()
+    // The malformed reply must reject the caller promptly — not hang for the
+    // 30s default deadline.
+    const reply = host.handleRoute(0, {
+      method: 'GET', pathname: '/x', query: new URLSearchParams(), headers: {},
+      body: Buffer.alloc(0), signal: new AbortController().signal, deviceId: 'device',
+    })
+    await expect(reply).rejects.toMatchObject({ code: 'extension_failed', status: 500 })
+  })
+
+  it('keeps logging clone-safe and bounded without failing the action', async () => {
+    const workerModule = await buildExtensionWorkerEntry()
+    const root = await mkdtemp(join(tmpdir(), 'dsh-mobile-worker-logsafe-'))
+    directories.push(root)
+    await createExtensionDirectory(root, 'logsafe', `
+export default (api) => {
+  api.action('loud', { run: async () => {
+    api.context.logger.info(() => {}, Symbol('sym'), 'giant'.repeat(300_000))
+    return { ok: true }
+  } })
+}
+`)
+    const lines: unknown[][] = []
+    const context = new Context(); contexts.push(context)
+    const service = new MobileAccessService(context)
+    services.push(service)
+    await service.startLocal(root, context, { hostExecution: { mode: 'worker', workerModule } })
+    void lines
+    // Logging a function, a symbol, and a 1.8MB string must neither throw into
+    // the action nor clone-error the worker.
+    const active = service.extension('logsafe') as { readonly worker: ExtensionWorkerHost } | undefined
+    if (active === undefined) throw new Error('logsafe extension did not load')
+    await expect(service.invoke('logsafe', 'loud', {}, caller())).resolves.toBeInstanceOf(PreparedJsonResult)
+  })
+
+  it('preserves api.manifest.id and awaits failing async effects at activation', async () => {
+    const workerModule = await buildExtensionWorkerEntry()
+    // Staging is atomic: a failing extension aborts the whole pass, so the
+    // parity and failing-effect extensions live in separate roots.
+    const parityRoot = await mkdtemp(join(tmpdir(), 'dsh-mobile-worker-parity-'))
+    directories.push(parityRoot)
+    await createExtensionDirectory(parityRoot, 'parity', `
+export default (api) => {
+  api.action('whoami', { run: async () => ({ id: api.manifest.id }) })
+}
+`)
+    const effectRoot = await mkdtemp(join(tmpdir(), 'dsh-mobile-worker-badeffect-'))
+    directories.push(effectRoot)
+    await createExtensionDirectory(effectRoot, 'badeffect', `
+export default (api) => {
+  api.effect(async () => { throw new Error('effect exploded') })
+}
+`)
+    const context = new Context(); contexts.push(context)
+    const service = new MobileAccessService(context)
+    services.push(service)
+    await service.startLocal(parityRoot, context, { hostExecution: { mode: 'worker', workerModule } })
+
+    // api.manifest.id must be the extension id, exactly like in-process mode.
+    const reply = await service.invoke('parity', 'whoami', {}, caller()) as PreparedJsonResult
+    expect(reply.bytes.toString('utf8')).toBe('{"id":"parity"}')
+
+    const effectContext = new Context(); contexts.push(effectContext)
+    const effectService = new MobileAccessService(effectContext)
+    services.push(effectService)
+    await effectService.startLocal(effectRoot, effectContext, { hostExecution: { mode: 'worker', workerModule } })
+    // A rejected async effect must fail activation (in-process contract).
+    expect(effectService.extension('badeffect')).toBeUndefined()
+    expect(effectService.status().failed).toBeGreaterThanOrEqual(1)
   })
 })

@@ -83,6 +83,18 @@ function send(message: unknown): void {
   port.postMessage(message)
 }
 
+/** Upper bound for one stringified log argument forwarded to the parent. */
+const LOG_ARG_MAX_CHARS = 4_096
+
+/** Render a log argument that structured cloning cannot carry (or that is huge). */
+function sanitizeLogArg(value: unknown): unknown {
+  if (typeof value === 'function' || typeof value === 'symbol') return `[${typeof value}]`
+  if (typeof value === 'string' && value.length > LOG_ARG_MAX_CHARS) {
+    return `${value.slice(0, LOG_ARG_MAX_CHARS)}…(+${value.length - LOG_ARG_MAX_CHARS} chars)`
+  }
+  return value
+}
+
 function log(level: 'debug' | 'info' | 'warn' | 'error', args: readonly unknown[]): void {
   const now = Date.now()
   if (now - logWindowStartedAt >= WORKER_LOG_WINDOW_MS) {
@@ -91,7 +103,18 @@ function log(level: 'debug' | 'info' | 'warn' | 'error', args: readonly unknown[
   }
   if (logWindowCount >= LOG_QUEUE_LIMIT) return
   logWindowCount += 1
-  send({ kind: 'log', level, args })
+  try {
+    // Logging must never fail the host's calling code: clone-unsafe values are
+    // rendered, oversized strings are truncated, and a postMessage failure
+    // (deep non-cloneable objects) is swallowed.
+    send({ kind: 'log', level, args: args.map(sanitizeLogArg) })
+  } catch { /* dropped */ }
+}
+
+/** Bound a forwarded error message so it cannot carry unbounded text. */
+function boundedMessage(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error)
+  return text.length > 500 ? text.slice(0, 500) : text
 }
 
 const loggerAdapter = {
@@ -106,7 +129,7 @@ let lifecycleReplyId = 'lifecycle'
 
 port.on('message', (message: ParentMessage) => {
   void handleMessage(message).catch((error: unknown) => {
-    send({ kind: 'error', runtimeId, id: lifecycleReplyId, code: 'extension_failed', message: error instanceof Error ? error.message : String(error), status: 500 })
+    send({ kind: 'error', runtimeId, id: lifecycleReplyId, code: 'extension_failed', message: boundedMessage(error), status: 500 })
   })
 })
 
@@ -143,20 +166,56 @@ function wakeSendBudgetWaiters(): void {
 }
 
 /**
- * Wait until a piece may be sent: its per-stream window has credit AND the
- * per-worker aggregate in-flight bound would not be exceeded.
+ * Atomically check and debit send budget for one piece: the per-stream window
+ * must hold it AND the per-worker aggregate in-flight bound must hold. Check
+ * and debit are one synchronous step, so concurrently awakened pumps can never
+ * double-reserve the same freed capacity.
  */
-async function waitForSendBudget(id: string, length: number, bail: () => boolean): Promise<void> {
-  while ((streamCredit.get(id) ?? 0) < length || inFlightTotal() + length > WORKER_STREAM_AGGREGATE_BYTES) {
-    if (bail()) return
+function tryReserve(id: string, length: number): boolean {
+  const credit = streamCredit.get(id) ?? 0
+  if (credit < length) return false
+  if (inFlightTotal() + length > WORKER_STREAM_AGGREGATE_BYTES) return false
+  streamCredit.set(id, credit - length)
+  streamSent.set(id, (streamSent.get(id) ?? 0) + length)
+  return true
+}
+
+/**
+ * Grant freed aggregate headroom to starved streams (oldest first): each may
+ * receive up to one max chunk, bounded by its remaining window. Without this,
+ * a stream that opened while the aggregate was exhausted (initial credit 0)
+ * could never send, because only its own acknowledgments replenish it.
+ */
+function redistributeAggregate(): void {
+  let headroom = WORKER_STREAM_AGGREGATE_BYTES - inFlightTotal()
+  if (headroom <= 0) return
+  for (const id of streamCredit.keys()) {
+    const credit = streamCredit.get(id) ?? 0
+    if (credit >= WORKER_STREAM_MAX_CHUNK_BYTES) continue
+    const ownInFlight = (streamSent.get(id) ?? 0) - (streamAcked.get(id) ?? 0)
+    const windowHeadroom = WORKER_STREAM_CREDIT_BYTES - ownInFlight - credit
+    const grant = Math.min(headroom, WORKER_STREAM_MAX_CHUNK_BYTES - credit, windowHeadroom)
+    if (grant <= 0) continue
+    streamCredit.set(id, credit + grant)
+    headroom -= grant
+    if (headroom <= 0) break
+  }
+  wakeSendBudgetWaiters()
+}
+
+/** Wait until a piece may be sent; resolves false when the caller bailed. */
+async function acquireSendBudget(id: string, length: number, bail: () => boolean): Promise<boolean> {
+  while (!tryReserve(id, length)) {
+    if (bail()) return false
     await new Promise<void>(resolve => { sendBudgetWaiters.push(resolve) })
   }
+  return true
 }
 
 async function handleMessage(message: ParentMessage): Promise<void> {
   if (message.kind === 'activate') {
     lifecycleReplyId = message.id
-    await activate(message.id, message.hostFile, message.generation)
+    await activate(message.id, message.hostFile, message.generation, message.manifest)
     return
   }
   if (message.kind === 'invoke') {
@@ -170,6 +229,8 @@ async function handleMessage(message: ParentMessage): Promise<void> {
   if (message.kind === 'stream-ack') {
     streamAcked.set(message.id, (streamAcked.get(message.id) ?? 0) + message.bytes)
     streamCredit.set(message.id, (streamCredit.get(message.id) ?? 0) + message.bytes)
+    // Freed aggregate headroom may unblock streams that opened starved.
+    redistributeAggregate()
     wakeSendBudgetWaiters()
     return
   }
@@ -255,7 +316,7 @@ async function runRoute(message: {
       send({ kind: 'error', runtimeId, id: message.id, code: business.code, message: business.message, status: business.status })
       return
     }
-    send({ kind: 'error', runtimeId, id: message.id, code: 'extension_failed', message: error instanceof Error ? error.message : String(error), status: 500 })
+    send({ kind: 'error', runtimeId, id: message.id, code: 'extension_failed', message: boundedMessage(error), status: 500 })
   } finally {
     requestControllers.delete(message.id)
     generationController.signal.removeEventListener('abort', onGenerationAbort)
@@ -286,12 +347,12 @@ async function pumpStream(id: string, source: import('node:stream').Readable, me
     streamSent.delete(id)
     streamAcked.delete(id)
     // Freed aggregate budget may unblock other streams.
-    wakeSendBudgetWaiters()
+    redistributeAggregate()
   }
   source.once('error', error => {
     if (ended) return
     finish()
-    send({ kind: 'stream-error', runtimeId, id, message: error instanceof Error ? error.message : String(error) })
+    send({ kind: 'stream-error', runtimeId, id, message: boundedMessage(error) })
   })
   try {
     for await (const chunk of source) {
@@ -300,16 +361,14 @@ async function pumpStream(id: string, source: import('node:stream').Readable, me
       // A chunk larger than the whole window can never be granted: split it.
       for (let offset = 0; offset < bytes.byteLength;) {
         const piece = bytes.subarray(offset, Math.min(offset + WORKER_STREAM_MAX_CHUNK_BYTES, bytes.byteLength))
-        // Explicit pull/credit flow control plus the per-worker aggregate bound.
-        await waitForSendBudget(id, piece.byteLength, () => source.destroyed || ended)
-        if (ended || source.destroyed || generationController.signal.aborted) {
+        // Explicit pull/credit flow control plus the per-worker aggregate bound;
+        // reservation is atomic, so competing wakes cannot over-send.
+        if (!(await acquireSendBudget(id, piece.byteLength, () => source.destroyed || ended))) {
           finish()
           send({ kind: 'stream-end', runtimeId, id })
           source.destroy()
           return
         }
-        streamCredit.set(id, (streamCredit.get(id) ?? 0) - piece.byteLength)
-        streamSent.set(id, (streamSent.get(id) ?? 0) + piece.byteLength)
         send({ kind: 'stream-chunk', runtimeId, id, bytes: new Uint8Array(piece) })
         offset += piece.byteLength
       }
@@ -323,9 +382,12 @@ async function pumpStream(id: string, source: import('node:stream').Readable, me
   }
 }
 
-async function activate(replyId: string, hostFile: string, generation: string): Promise<void> {
+async function activate(replyId: string, hostFile: string, generation: string, manifest: import('./extension-worker-protocol.js').WorkerActivationManifest): Promise<void> {
+  // Async effect setups gate activation exactly like the in-process path: a
+  // rejection fails activation instead of vanishing.
+  const pendingEffects: Promise<void>[] = []
   const api: RuntimeHostApi = {
-    manifest: { id: hostFile },
+    manifest,
     context: { logger: loggerAdapter },
     schema: z,
     signal: generationController.signal,
@@ -341,7 +403,7 @@ async function activate(replyId: string, hostFile: string, generation: string): 
     effect(setup) {
       const result = setup()
       if (result instanceof Promise) {
-        void result.then(cleanup => { if (typeof cleanup === 'function') cleanups.push(cleanup) }).catch(() => undefined)
+        pendingEffects.push(result.then(cleanup => { if (typeof cleanup === 'function') cleanups.push(cleanup) }))
       } else if (typeof result === 'function') {
         cleanups.push(result)
       }
@@ -357,8 +419,9 @@ async function activate(replyId: string, hostFile: string, generation: string): 
   if (generationController.signal.aborted) return
   try {
     if (imported.default !== undefined) await imported.default(api)
+    await Promise.all(pendingEffects)
   } catch (error) {
-    send({ kind: 'error', runtimeId, id: replyId, code: 'host_activation_failed', message: error instanceof Error ? error.message : String(error), status: 500 })
+    send({ kind: 'error', runtimeId, id: replyId, code: 'host_activation_failed', message: boundedMessage(error), status: 500 })
     return
   }
   const actionMetadata: WorkerActionMetadata[] = [...actions.entries()].map(([name, spec]) => {
@@ -394,7 +457,7 @@ async function runAction(id: string, name: string, deviceId: string, input: unkn
       send({ kind: 'error', runtimeId, id, code: business.code, message: business.message, status: business.status })
       return
     }
-    send({ kind: 'error', runtimeId, id, code: 'extension_failed', message: error instanceof Error ? error.message : String(error), status: 500 })
+    send({ kind: 'error', runtimeId, id, code: 'extension_failed', message: boundedMessage(error), status: 500 })
   }
   try {
     let parsed = input

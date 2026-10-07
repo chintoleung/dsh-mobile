@@ -31,17 +31,21 @@ export function isPreparedJson(value: unknown): value is PreparedJsonResult {
   return value instanceof PreparedJsonResult
 }
 
-/** Resolve the packaged worker entry next to this module (lib/ adjacency). */
-export function defaultExtensionWorkerModule(): string {
-  return new URL('./extension-worker-runtime.mjs', import.meta.url).href
+/**
+ * Resolve the packaged worker entry next to this module (lib/ adjacency) as a
+ * URL object — `new Worker()` accepts a URL object, but a stringified file:
+ * URL is treated as a filesystem path and fails with ERR_WORKER_PATH.
+ */
+export function defaultExtensionWorkerModule(): URL {
+  return new URL('./extension-worker-runtime.mjs', import.meta.url)
 }
 
 /** Parent logger shape forwarded from the worker's logger-only context adapter. */
 export type WorkerParentLogger = Record<'debug' | 'info' | 'warn' | 'error', (...args: unknown[]) => void>
 
 export interface ExtensionWorkerHostOptions {
-  /** Path or URL of the standalone worker entry (lib/extension-worker-runtime.mjs or a test build). */
-  readonly workerModule: string
+  /** Path or URL object of the standalone worker entry (lib/extension-worker-runtime.mjs or a test build). */
+  readonly workerModule: string | URL
   readonly hostFile: string
   readonly manifest: LocalExtensionManifest
   readonly generation: string
@@ -81,6 +85,10 @@ export class ExtensionWorkerHost {
   private dead = false
   private readonly exited: Promise<void>
   private disposed = false
+  /** Deadline-detached routes whose late responses need cancel supervision. */
+  private readonly detachedRoutes = new Set<string>()
+  /** Per-request cleanup-grace timers; fire only if the work is still live. */
+  private readonly executionGrace = new Map<string, NodeJS.Timeout>()
 
   constructor(options: ExtensionWorkerHostOptions) {
     this.options = options
@@ -114,6 +122,7 @@ export class ExtensionWorkerHost {
       id: LIFECYCLE_ID,
       hostFile: this.options.hostFile,
       generation: this.options.generation,
+      manifest: this.options.manifest,
     }, this.options.activationTimeoutMs ?? ACTIVATION_TIMEOUT_MS, new AbortController().signal)
     if (this.activation === undefined) throw new MobileExtensionError('host_activation_failed', `extension ${this.options.manifest.id} worker activation failed`, 500)
     return this.activation
@@ -139,25 +148,20 @@ export class ExtensionWorkerHost {
     const onAbort = (): void => { this.post({ kind: 'cancel', id }) }
     if (caller.signal.aborted) throw caller.signal.reason ?? new MobileExtensionError('extension_action_cancelled', 'caller detached', 409)
     caller.signal.addEventListener('abort', onAbort, { once: true })
-    // The RPC outlives the caller: settlement must observe the underlying work,
-    // and an unresponsive worker is terminated after a bounded cleanup grace.
+    // The RPC outlives the caller: settlement must observe the underlying work.
+    // A deadline-detached request posts cooperative cancellation first, then
+    // arms the cleanup grace; an unresponsive worker is terminated when the
+    // grace expires with the work still unresolved.
     const reply = this.rpc(id, { kind: 'invoke', id, action, deviceId: caller.deviceId, input }, 0, caller.signal)
-    let graceTimer: NodeJS.Timeout | undefined
-    const armGrace = (): void => {
-      if (graceTimer !== undefined) return
-      graceTimer = setTimeout(() => { void this.terminate('deadline-unresponsive') }, WORKER_DEADLINE_GRACE_MS)
-      graceTimer.unref?.()
-    }
-    const settleGrace = (): void => { if (graceTimer !== undefined) { clearTimeout(graceTimer); graceTimer = undefined } }
-    // A detached-but-late worker reply disarms the grace timer on settlement.
-    void reply.then(settleGrace, settleGrace)
+    void reply.then(() => { this.settleExecutionGrace(id) }, () => { this.settleExecutionGrace(id) })
     let deadlineTimer: NodeJS.Timeout | undefined
     try {
       return await Promise.race([
         reply,
         new Promise<never>((_, reject) => {
           deadlineTimer = setTimeout(() => {
-            armGrace()
+            this.post({ kind: 'cancel', id })
+            this.armExecutionGrace(id, 'deadline-unresponsive')
             reject(new MobileExtensionError('extension_action_timeout', `extension ${this.options.manifest.id} action ${action} timed out`, 500))
           }, timeoutMs)
           deadlineTimer.unref?.()
@@ -166,11 +170,6 @@ export class ExtensionWorkerHost {
     } finally {
       if (deadlineTimer !== undefined) clearTimeout(deadlineTimer)
       caller.signal.removeEventListener('abort', onAbort)
-      if (graceTimer !== undefined) {
-        // The race may have settled by deadline; keep the grace armed only
-        // while the underlying RPC is genuinely unresolved.
-        if (!this.pending.has(id)) settleGrace()
-      }
     }
   }
 
@@ -196,21 +195,19 @@ export class ExtensionWorkerHost {
         headers: request.headers, body: new Uint8Array(request.body), deviceId: request.deviceId,
       })
     })
-    let graceTimer: NodeJS.Timeout | undefined
-    const armGrace = (): void => {
-      if (graceTimer !== undefined) return
-      graceTimer = setTimeout(() => { void this.terminate('route-deadline-unresponsive') }, WORKER_DEADLINE_GRACE_MS)
-      graceTimer.unref?.()
-    }
-    const settleGrace = (): void => { if (graceTimer !== undefined) { clearTimeout(graceTimer); graceTimer = undefined } }
-    void reply.then(settleGrace, settleGrace)
+    // The reply promise outlives the caller. A late stream response for a
+    // detached caller is intercepted (cancelled and supervised to an end)
+    // instead of resolving into a bridge nobody consumes.
+    void reply.then(() => { this.settleExecutionGrace(id) }, () => { this.settleExecutionGrace(id) })
     let deadlineTimer: NodeJS.Timeout | undefined
     try {
       return await Promise.race([
         reply,
         new Promise<never>((_, reject) => {
           deadlineTimer = setTimeout(() => {
-            if (this.routePending.has(id)) armGrace()
+            this.post({ kind: 'cancel', id })
+            if (this.routePending.has(id)) this.detachedRoutes.add(id)
+            this.armExecutionGrace(id, 'route-deadline-unresponsive')
             reject(new MobileExtensionError('extension_route_timeout', `extension ${this.options.manifest.id} route ${request.method} ${request.pathname} timed out`, 500))
           }, timeoutMs)
           deadlineTimer.unref?.()
@@ -219,7 +216,6 @@ export class ExtensionWorkerHost {
     } finally {
       if (deadlineTimer !== undefined) clearTimeout(deadlineTimer)
       request.signal.removeEventListener('abort', onAbort)
-      if (graceTimer !== undefined && !this.routePending.has(id)) settleGrace()
     }
   }
 
@@ -243,8 +239,36 @@ export class ExtensionWorkerHost {
     return this.exited
   }
 
+  /**
+   * Arm the cleanup grace for one request: terminate the worker only if the
+   * request's underlying execution is still unresolved when the grace expires.
+   */
+  private armExecutionGrace(id: string, reason: string): void {
+    if (this.dead || this.executionGrace.has(id)) return
+    const timer = setTimeout(() => {
+      this.executionGrace.delete(id)
+      if (this.pending.has(id) || this.routePending.has(id) || this.streams.has(id) || this.detachedRoutes.has(id)) {
+        void this.terminate(reason)
+      }
+    }, WORKER_DEADLINE_GRACE_MS)
+    timer.unref?.()
+    this.executionGrace.set(id, timer)
+  }
+
+  /** Disarm the cleanup grace: the request's execution has been confirmed ended. */
+  private settleExecutionGrace(id: string): void {
+    const timer = this.executionGrace.get(id)
+    if (timer !== undefined) {
+      clearTimeout(timer)
+      this.executionGrace.delete(id)
+    }
+  }
+
   /** Hard-terminate the worker now; every pending RPC settles unavailable. */
   async terminate(reason: string): Promise<void> {
+    for (const timer of this.executionGrace.values()) clearTimeout(timer)
+    this.executionGrace.clear()
+    this.detachedRoutes.clear()
     if (!this.dead) await this.worker.terminate().catch(() => undefined)
     void reason
     await this.exited
@@ -324,9 +348,18 @@ export class ExtensionWorkerHost {
     if (message.kind === 'route-response') {
       const response = raw as { readonly kind: 'route-response'; readonly status?: unknown; readonly contentType?: unknown; readonly headers?: unknown; readonly bytes?: unknown }
       const route = this.routePending.get(tagged.id)
-      this.routePending.delete(tagged.id)
       if (route === undefined) return
-      if (response.bytes !== undefined && !(response.bytes instanceof Uint8Array)) return
+      // Validate the payload BEFORE taking ownership away: a malformed reply
+      // must reject the caller (and keep cleanup supervision coherent), never
+      // silently orphan the RPC until the default deadline.
+      if (response.bytes !== undefined && !(response.bytes instanceof Uint8Array)) {
+        this.routePending.delete(tagged.id)
+        this.detachedRoutes.delete(tagged.id)
+        route.reject(new MobileExtensionError('extension_failed', 'extension route failed', 500))
+        return
+      }
+      this.routePending.delete(tagged.id)
+      this.detachedRoutes.delete(tagged.id)
       route.resolve({
         ...(typeof response.status === 'number' ? { status: response.status } : {}),
         ...(typeof response.contentType === 'string' ? { contentType: response.contentType } : {}),
@@ -338,8 +371,17 @@ export class ExtensionWorkerHost {
     if (message.kind === 'stream-start') {
       const start = raw as { readonly kind: 'stream-start'; readonly status?: unknown; readonly contentType?: unknown; readonly headers?: unknown }
       const route = this.routePending.get(tagged.id)
-      this.routePending.delete(tagged.id)
       if (route === undefined) return
+      // A stream that arrives after its caller timed out belongs to cleanup:
+      // cancel it and supervise until the confirmed end — never open a bridge
+      // nobody consumes.
+      if (this.detachedRoutes.has(tagged.id)) {
+        this.routePending.delete(tagged.id)
+        this.cancelledStreams += 1
+        this.post({ kind: 'stream-cancel', id: tagged.id })
+        return
+      }
+      this.routePending.delete(tagged.id)
       const live = this.openStream(tagged.id)
       route.resolve({
         ...(typeof start.status === 'number' ? { status: start.status } : {}),
@@ -360,12 +402,16 @@ export class ExtensionWorkerHost {
       return
     }
     if (message.kind === 'stream-end') {
+      this.detachedRoutes.delete(tagged.id)
+      this.settleExecutionGrace(tagged.id)
       this.closeStream(tagged.id)
       return
     }
     if (message.kind === 'stream-error') {
       const failure = raw as { readonly kind: 'stream-error'; readonly message?: unknown }
       const live = this.streams.get(tagged.id)
+      this.detachedRoutes.delete(tagged.id)
+      this.settleExecutionGrace(tagged.id)
       this.closeStream(tagged.id)
       live?.bridge.destroy(new Error(typeof failure.message === 'string' ? failure.message : 'worker stream failed'))
     }
@@ -459,7 +505,25 @@ class WorkerStreamBridge extends Readable {
   }
 
   pushEnd(): void {
-    if (!this.destroyed) this.push(null)
+    if (this.destroyed) return
+    // Deliver everything already received before signaling EOF: Node will not
+    // call _read again after the stream ends, so queued chunks must be pushed
+    // now or they are lost.
+    while (this.queue.length > 0) {
+      const chunk = this.queue.shift()
+      if (chunk === undefined) break
+      this.push(chunk)
+      this.consume(chunk.byteLength)
+    }
+    this.awaiting = false
+    this.push(null)
+  }
+
+  override _destroy(error: Error | null, callback: (error?: Error | null) => void): void {
+    // A destroyed consumer owns nothing: drop undelivered chunks.
+    this.queue.length = 0
+    this.awaiting = false
+    callback(error)
   }
 
   override _read(): void {

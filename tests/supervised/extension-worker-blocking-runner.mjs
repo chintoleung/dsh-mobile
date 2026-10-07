@@ -42,10 +42,15 @@ async function writeExtension(root, hostSource) {
 async function scenarioA() {
   const root = await mkdtemp(join(tmpdir(), 'dsh-worker-block-a-'))
   try {
-    // `spin` synchronously blocks the worker thread forever.
+    // `spin` synchronously blocks the worker thread forever — but only after
+    // appending a marker, so the runner can PROVE the block started before
+    // measuring parent-loop responsiveness.
+    const marker = join(root, 'started.marker')
     await writeExtension(root, `
+import { appendFile } from 'node:fs/promises'
+const marker = ${JSON.stringify(marker)}
 export default (api) => {
-  api.action('spin', { timeoutMs: 300, run: () => { while (true) {} } })
+  api.action('spin', { timeoutMs: 300, run: async () => { await appendFile(marker, 'go'); while (true) {} } })
   api.action('probe', { run: async () => ({ ok: true }) })
 }
 `)
@@ -57,10 +62,16 @@ export default (api) => {
     const caller = { signal: new AbortController().signal, deviceId: 'device' }
 
     const spin = host.invoke('spin', {}, caller)
-    // While the worker thread is blocked, the parent loop must stay responsive.
+    // Wait until the worker has actually entered its blocking loop.
+    const { existsSync } = await import('node:fs')
     const startedAt = Date.now()
+    while (!existsSync(marker)) {
+      if (Date.now() - startedAt > 2_000) throw new Error('worker never signaled it started blocking')
+      await new Promise(resolve => { setTimeout(resolve, 20) })
+    }
+    // While the worker thread is blocked, the parent loop must stay responsive.
     const pong = await fetch(`http://127.0.0.1:${port}/ping`)
-    const responsive = pong.status === 200 && Date.now() - startedAt < 1_000
+    const responsive = pong.status === 200 && Date.now() - startedAt < 3_000
 
     let timedOut = false
     try { await spin } catch (error) { timedOut = error?.code === 'extension_action_timeout' }

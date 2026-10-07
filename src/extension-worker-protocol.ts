@@ -38,6 +38,17 @@ export interface WorkerActivateMessage {
   readonly id: string
   readonly hostFile: string
   readonly generation: string
+  /** Full manifest so `api.manifest` matches the in-process contract. */
+  readonly manifest: WorkerActivationManifest
+}
+
+/** Manifest shape crossing the boundary (structural, Cordis-free). */
+export interface WorkerActivationManifest {
+  readonly schemaVersion: 1
+  readonly id: string
+  readonly name: string
+  readonly version: string
+  readonly description?: string
 }
 
 /** Parent → worker: run one action; reply with worker-serialized bytes. */
